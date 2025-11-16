@@ -1,0 +1,1771 @@
+Skip to content
+Chat history
+
+You said:
+import os.path as osp
+from pathlib import Path
+from datetime import datetime
+import torch.nn.functional as F
+import random
+import os
+import imageio.v3 as iio
+import torch
+import tyro
+from einops import repeat
+from seva.eval import transform_img_and_K, get_value_dict, save_output, seed_everything, decode_output
+from seva.geometry import DEFAULT_FOV_RAD, get_default_intrinsics, get_preset_pose_fov
+from seva.model import SGMWrapper
+from seva.modules.autoencoder import AutoEncoder
+from seva.modules.conditioner import CLIPConditioner
+from seva.utils import load_model
+from seva.sampling import (
+    MultiviewCFG
+)
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from seva.sampling import DiscreteDenoiser, append_dims, to_d
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from peft import LoraConfig, get_peft_model
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+# Constants
+WORK_DIR = "work_dirs/demo_cli"
+
+T = 21
+
+
+
+def get_target_c2ws_and_Ks_from_preset(
+    preprocessed: dict, preset_traj: str, num_frames: int, zoom_factor: float
+):
+    img_wh = preprocessed["input_wh"]
+    start_c2w = preprocessed["input_c2ws"][0]
+    start_w2c = torch.linalg.inv(start_c2w)
+    look_at = torch.tensor([0, 0, 10])
+    start_fov = DEFAULT_FOV_RAD
+
+    target_c2ws, target_fovs = get_preset_pose_fov(
+        preset_traj,
+        num_frames,
+        start_w2c,
+        look_at,
+        -start_c2w[:3, 1],
+        start_fov,
+        spiral_radii=[1.0, 1.0, 0.5],
+        zoom_factor=zoom_factor,
+    )
+    target_c2ws = torch.as_tensor(target_c2ws)
+    target_fovs = torch.as_tensor(target_fovs)
+    target_Ks = get_default_intrinsics(
+        target_fovs, aspect_ratio=img_wh[0] / img_wh[1]
+    )
+    return target_c2ws, target_Ks
+
+class Image_Camera(Dataset):
+    def __init__(self, root_dir, preset_traj, num_frames, zoom_factor, camera_scale):
+        super().__init__()
+        self.root_dir = root_dir
+        self.img_files = [
+            os.path.join(root_dir, f)
+            for f in os.listdir(root_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+        self.preset_traj = preset_traj
+        self.num_frames = num_frames
+        self.zoom_factor = zoom_factor
+        self.camera_scale = camera_scale
+        self.img_files.sort()
+    def preprocess(self, input_img_path: str, preset_traj, num_frames, zoom_factor, camera_scale):
+        shorter = 512  # must divided by 64
+
+        input_imgs = torch.as_tensor(
+            iio.imread(input_img_path) / 255.0, dtype=torch.float32
+        )[None, ..., :3]
+        input_imgs = transform_img_and_K(
+            input_imgs.permute(0, 3, 1, 2), shorter, K=None, size_stride=64
+        )[0].permute(0, 2, 3, 1)
+
+        input_Ks = get_default_intrinsics(
+            aspect_ratio=input_imgs.shape[2] / input_imgs.shape[1]
+        )
+        input_c2ws = torch.eye(4)[None].to(dtype=torch.float32)
+
+        preprocessed = {
+            "input_imgs": input_imgs,
+            "input_Ks": input_Ks,
+            "input_c2ws": input_c2ws,
+            "input_wh": (input_imgs.shape[2], input_imgs.shape[1]),
+        }
+        W, H = preprocessed["input_wh"]
+        
+        target_c2ws, target_Ks = get_target_c2ws_and_Ks_from_preset(
+            preprocessed, preset_traj, num_frames, zoom_factor
+        )
+        all_c2ws = torch.cat([input_c2ws, target_c2ws], 0)
+        all_Ks = torch.cat([input_Ks, target_Ks], 0) * input_Ks.new_tensor([W, H, 1])[:, None]
+
+        traj_prior_c2ws = all_c2ws[1:]
+
+        # --- Normalize input images only ---
+        input_imgs = input_imgs[0].permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+        input_imgs = input_imgs * 2.0 - 1.0  # already in [0,1], scale to [-1,1]
+
+        # --- Get corresponding poses ---
+        input_Ks = all_Ks[[0]]
+
+        curr_input_sels = [0]  # input always at index 0
+        curr_imgs = torch.cat(
+            [input_imgs, input_imgs.new_zeros(len(traj_prior_c2ws), *input_imgs.shape[1:])],
+            dim=0,
+        )
+        curr_c2ws = torch.cat([input_c2ws, traj_prior_c2ws], dim=0)
+        curr_Ks = torch.cat([input_Ks, all_Ks[1:]], dim=0)
+
+        # --- Build value_dict ---
+        value_dict = get_value_dict(
+            curr_imgs.to("cuda"),
+            curr_input_sels,
+            curr_c2ws,
+            curr_Ks,
+            list(range(T)),
+            all_c2ws=all_c2ws,
+            camera_scale=camera_scale,
+        )
+        return value_dict
+    def __len__(self):
+        return len(self.img_files)
+    def __getitem__(self, idx):
+        img_path = self.img_files[idx]
+        sample = self.preprocess(img_path, self.preset_traj, self.num_frames, self.zoom_factor, self.camera_scale)
+        return sample
+def main(
+    input_imgs: str,
+    seed: int = 23,
+    cfg: float = 4.0,
+    preset_traj: str = "orbit",
+    num_frames: int = 20,
+    zoom_factor: float = 1.0,
+    camera_scale: float = 2.0,
+    num_steps = 2,
+    cfg_min = 1.2,
+    learning_rate = 1e-6,
+    learning_rate_lora = 1e-5,
+    epochs=2,
+    s_tmin=0.0, 
+    s_tmax=999.0
+):
+    H, W = 512, 512
+    
+    
+    torch.cuda.empty_cache()
+    accelerator = Accelerator(
+        gradient_accumulation_steps=1,
+        mixed_precision='bf16'
+    )
+    device = accelerator.device
+    seed_everything(seed)
+    # Dataset
+    dataset = Image_Camera(root_dir=input_imgs, preset_traj=preset_traj, num_frames=num_frames, zoom_factor=zoom_factor, camera_scale=camera_scale)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    # Model, ae, condition
+    teacher = SGMWrapper(load_model(device="cpu", verbose=True)).to(device)
+    teacher.module.to(dtype=torch.bfloat16)
+    config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["to_q"],  # layers to inject LoRA
+        bias="none"
+    )
+    teacher = get_peft_model(teacher, config)
+    teacher.print_trainable_parameters()
+    student = SGMWrapper(load_model(device="cpu", verbose=True)).to(dtype=torch.bfloat16)
+    student.to(device)
+    
+    teacher.train()
+    student.train()
+
+    ae = AutoEncoder(chunk_size=1).to(device).eval()
+    conditioner = CLIPConditioner().to(device).eval()
+    ##
+    ae.requires_grad_(False)
+    conditioner.requires_grad_(False)
+    ##
+    denoiser = DiscreteDenoiser(num_idx=1000, device=device)
+    guider=MultiviewCFG(cfg_min)
+    ##
+    optimizer_student = AdamW(student.parameters(), lr = learning_rate)
+    optimizer_lora = AdamW(teacher.parameters(), lr = learning_rate_lora)
+    ##
+    lr_scheduler = CosineAnnealingLR(optimizer_student, T_max=100)
+    lr_scheduler_lora = CosineAnnealingLR(optimizer_lora, T_max=100)
+    ##
+    teacher, student, dataloader = accelerator.prepare(teacher, student, dataloader)
+    optimizer_student, optimizer_lora, lr_scheduler, lr_scheduler_lora = accelerator.prepare(optimizer_student, optimizer_lora, lr_scheduler, lr_scheduler_lora)
+    
+    for epoch in range(epochs):
+        print(f"Epoch {epoch + 1}/{epochs}")
+        for value_dict in dataloader:
+            torch.cuda.reset_peak_memory_stats()
+            # Clear gradients
+            optimizer_student.zero_grad()
+            optimizer_lora.zero_grad()
+            # Extract batch data
+            imgs = value_dict["cond_frames"][0].to(device)
+            input_masks = value_dict["cond_frames_mask"][0].to(device)
+            pluckers = value_dict["plucker_coordinate"][0].to(device)
+            
+            
+            # --- Encode ---
+            ae.to(device)
+            conditioner.to(device)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                latents = torch.nn.functional.pad(
+                    ae.encode(imgs[input_masks], 1), (0, 0, 0, 0, 0, 1), value=1.0
+                )
+
+                c_crossattn = repeat(conditioner(imgs[input_masks]).mean(0), "d -> n 1 d", n=T)
+            ae.to('cpu')
+            conditioner.to('cpu')
+            uc_crossattn = torch.zeros_like(c_crossattn)
+
+            c_replace = latents.new_zeros(T, *latents.shape[1:])
+            c_replace[input_masks] = latents
+            uc_replace = torch.zeros_like(c_replace)
+
+            c_concat = torch.cat(
+                [
+                    repeat(
+                        input_masks,
+                        "n -> n 1 h w",
+                        h=pluckers.shape[2],
+                        w=pluckers.shape[3],
+                    ),
+                    pluckers,
+                ],
+                1,
+            )
+            uc_concat = torch.cat(
+                [pluckers.new_zeros(T, 1, *pluckers.shape[-2:]), pluckers], 1
+            )
+
+            c_dense_vector = pluckers
+            uc_dense_vector = c_dense_vector
+
+            cond = {
+                "crossattn": c_crossattn,
+                "replace": c_replace,
+                "concat": c_concat,
+                "dense_vector": c_dense_vector,
+            }
+            uc = {
+                "crossattn": uc_crossattn,
+                "replace": uc_replace,
+                "concat": uc_concat,
+                "dense_vector": uc_dense_vector,
+            }
+            guider_kwargs = {
+                "c2w": value_dict["c2w"][0].to(device),
+                "K": value_dict["K"][0].to(device),
+                "input_frame_mask": value_dict["cond_frames_mask"][0].to(device),
+            }
+            del imgs, input_masks, pluckers
+            # Sample initial noise
+            latent = torch.randn((T, 4, H // 8, W // 8), dtype=torch.bfloat16, device=device)
+            
+            sigmas = denoiser.discretization(num_steps, device=device)
+            
+                
+            # random step
+            # first_step = sigmas[0] = 84.9163
+            second_step = (75.2586 - 0.1634) * torch.rand(1, device=device) + 0.1634
+            student_sigmas = torch.cat([sigmas[0:1], second_step])
+            student_sigmas = torch.sort(student_sigmas, descending=True).values
+            # student sigma will have first step with big noise, and second is random noise level
+            
+            s_in = latent.new_ones([latent.shape[0]])
+            s_churn=1.0 # 1.0 for student, 0.0 for teacher
+            
+            next_sigma = s_in * 0.0 # next_sigma = 0 for student predict x_0
+            guidance_scale = random.uniform(1.2, 4.0)
+            for step_idx, sigma_step in enumerate(student_sigmas):
+                gamma = min(s_churn / num_steps, 2**0.5 - 1) if s_tmin <= sigma_step <= s_tmax else 0.0
+                sigma = s_in * sigma_step
+                
+                sigma_hat = sigma * (gamma + 1.0) + 1e-6
+                x = latent * torch.sqrt(1.0 + sigma_step ** 2.0)
+                
+                denoised = denoiser(student, x, sigma_hat, cond, num_frames=T) # -> denoised.requires_grad = True
+                #denoised = denoiser(teacher, x, sigma_hat, cond, num_frames=T) --> denoised.requires_grad = False
+
+if __name__ == "__main__":
+    tyro.cli(main)
+why denoised = denoiser(student, x, sigma_hat, cond, num_frames=T) # -> denoised.requires_grad = True
+                #denoised = denoiser(teacher, x, sigma_hat, cond, num_frames=T) --> denoised.requires_grad = False 
+ChatGPT said:
+Good question 👍
+
+The key difference is whether the model is wrapped in torch.no_grad() or not.
+
+🔎 In your code:
+Student branch
+denoised = denoiser(student, x, sigma_hat, cond, num_frames=T)
+No torch.no_grad().
+
+student is in training mode (student.train()), and its parameters have requires_grad=True.
+
+When you call denoiser(student, ...), PyTorch builds a computation graph so that gradients can flow back to student.parameters().
+
+Therefore:
+
+denoised.requires_grad == True
+Teacher branch
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    latents = ae.encode(...)
+    c_crossattn = conditioner(...)
+
+# later
+# denoised = denoiser(teacher, x, sigma_hat, cond, num_frames=T)
+Your teacher model has been used entirely inside a with torch.no_grad(): context during encoding/conditioning.
+
+Even if you later call denoiser(teacher, ...) outside that block, the teacher was not intended for training — you don’t call optimizer_lora.step() on its main weights, only maybe LoRA adapters.
+
+In your current snippet, you commented it out, but if you actually run it inside torch.no_grad(), the output denoised will not be part of a computation graph:
+
+denoised.requires_grad == False
+⚖️ General rule:
+Student forward pass → requires_grad=True because you want gradients for training.
+
+Teacher forward pass → usually wrapped in torch.no_grad() because the teacher serves as a frozen target (teacher-student distillation).
+
+👉 That’s why:
+
+denoiser(student, ...) → True (tracked for backprop).
+
+denoiser(teacher, ...) → False (inference only, detached from graph).
+
+Do you want me to show you how to keep LoRA params of the teacher trainable while still keeping the base teacher frozen?
+
+You said:
+Your teacher model has been used entirely inside a with torch.no_grad(): context during encoding/conditioning ?? why ? I want to train teacher
+ChatGPT said:
+Ahh, got it 👍 — thanks for clarifying. Let’s carefully separate things here:
+
+1. Where you actually used torch.no_grad()
+Look at your code:
+
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    latents = torch.nn.functional.pad(
+        ae.encode(imgs[input_masks], 1), (0, 0, 0, 0, 0, 1), value=1.0
+    )
+    c_crossattn = repeat(conditioner(imgs[input_masks]).mean(0), "d -> n 1 d", n=T)
+This torch.no_grad() only applies to ae.encode and conditioner.
+It does not affect your teacher or student model calls — unless you also wrap those calls in another torch.no_grad() block.
+
+So right now:
+
+Autoencoder + Conditioner are frozen (no gradients).
+
+Teacher + Student are outside this block, so they can compute gradients normally.
+
+2. Why your teacher output had requires_grad=False
+That happens if you actually run the teacher forward pass inside a with torch.no_grad(): context.
+
+If you uncomment this line:
+
+# denoised = denoiser(teacher, x, sigma_hat, cond, num_frames=T)
+and put it inside the no_grad block, then the output will be detached:
+
+denoised.requires_grad == False
+If you run it outside no_grad, you’ll get:
+
+denoised.requires_grad == True
+(same as the student).
+
+3. Training the teacher
+From your config:
+
+config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["to_q"],
+    bias="none"
+)
+teacher = get_peft_model(teacher, config)
+This means: you only want to train the LoRA adapters inside the teacher, not its full base weights.
+
+When you call teacher.print_trainable_parameters(), you should see something like:
+
+trainable params: X / total params: Y (Z%)
+That’s correct: the base teacher weights remain frozen, only the LoRA weights update.
+
+✅ So the short answer:
+
+Your teacher forward pass only gives requires_grad=False if you accidentally put it inside torch.no_grad().
+
+If you want to train the teacher’s LoRA weights, just call it outside torch.no_grad(), and keep its optimizer (optimizer_lora) active.
+
+👉 Do you want me to modify your loop so student is trained via distillation loss while teacher updates its LoRA adapters at the same time? That way you’ll see both optimizers stepping correctly.
+
+You said:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        dense_y: torch.Tensor,
+        num_frames: int | None = None,
+    ) -> torch.Tensor:
+        num_frames = num_frames or self.params.num_frames
+        t_emb = timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        hs = []
+        h = x
+        for module in self.input_blocks:
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+            hs.append(h)
+        h = self.middle_block(
+            h,
+            emb=t_emb,
+            context=y,
+            dense_emb=dense_y,
+            num_frames=num_frames,
+        )
+        #h = checkpoint(self.middle_block, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        return self.out(h)
+I know the problem, if I wrap up teacher_lora + use checkpoint, it will not trainable, but if I use checkpoint with student, it still work. now how to take usage of checkpoint for teacher_lora for better memory
+ChatGPT said:
+Nice catch 🚀 — you hit one of the classic LoRA + gradient checkpointing pitfalls.
+
+Let’s unpack it carefully:
+
+🔎 Why student + checkpoint works, but teacher+LoRA + checkpoint breaks
+Student
+
+Normal model, all params requires_grad=True.
+
+When you call checkpoint(module, ...), PyTorch will re-compute the forward during backward pass, and the graph is intact. ✅
+
+Teacher + LoRA
+
+LoRA replaces some submodules with PeftModel wrappers.
+
+Inside those wrappers, some params are frozen (base model), some are trainable (LoRA adapters).
+
+When you use torch.utils.checkpoint.checkpoint(...), the forward pass is re-executed under no_grad unless inputs require grad.
+
+If your inputs (x, t_emb, y, etc.) don’t have requires_grad=True, the checkpointed block runs in inference mode — meaning LoRA params won’t get gradients. 🔴
+
+That’s why LoRA looks “not trainable” under checkpointing.
+
+✅ Solutions
+Option 1: Force checkpoint to track grads
+Wrap your checkpointed call with torch.set_grad_enabled(True):
+
+def forward_with_grad(module, *inputs):
+    with torch.set_grad_enabled(True):
+        return module(*inputs)
+
+h = checkpoint(forward_with_grad, module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+This forces PyTorch to compute the forward with grad enabled, even if inputs don’t require grad.
+
+Option 2: Use checkpoint_sequential for whole blocks
+Instead of checkpointing each LoRA-wrapped block, checkpoint a sequence of them:
+
+from torch.utils.checkpoint import checkpoint_sequential
+
+h = checkpoint_sequential(self.input_blocks, segments=len(self.input_blocks), 
+                          input=(h, t_emb, y, dense_y, num_frames))
+This keeps grads alive because the whole segment is checkpointed together.
+
+Option 3: Make dummy inputs require grad
+Before checkpointing, you can mark x (or other latent) as requiring grad:
+
+h.requires_grad_(True)
+This ensures checkpoint doesn’t silently disable grads for LoRA.
+⚠️ Downside: might increase graph size unnecessarily.
+
+Option 4: Use accelerate or xformers memory-efficient attention
+If your bottleneck is mostly in attention layers, using memory-efficient attention (e.g., torch.nn.functional.scaled_dot_product_attention or xFormers) often gives bigger savings than checkpointing LoRA-layers.
+
+🔧 Recommendation for your case
+Since you’re training teacher LoRA + student distillation:
+
+Keep student checkpointing as is (safe).
+
+For teacher:
+
+Wrap modules with Option 1 (set_grad_enabled), so LoRA adapters can still backprop.
+
+Keep checkpoint granularity coarser (e.g., checkpoint only large sequential blocks), to balance memory vs. compute.
+
+👉 Do you want me to modify your forward function to show exactly how to integrate Option 1 (safe for LoRA) in your current loop?
+
+You said:
+yes, show me forward for teacher
+ChatGPT said:
+Perfect 👍 let’s adapt your forward so that when you use checkpointing with teacher+LoRA, gradients still flow into LoRA params.
+
+The trick is to wrap each module call with torch.set_grad_enabled(True) inside checkpoint.
+
+✅ Modified forward for Teacher (checkpoint-safe with LoRA)
+import torch
+from torch.utils.checkpoint import checkpoint
+
+def forward(self,
+            x: torch.Tensor,
+            t: torch.Tensor,
+            y: torch.Tensor,
+            dense_y: torch.Tensor,
+            num_frames: int | None = None,
+            use_checkpoint: bool = True  # toggle for memory saving
+) -> torch.Tensor:
+    num_frames = num_frames or self.params.num_frames
+
+    # timestep embedding
+    t_emb = timestep_embedding(t, self.model_channels)
+    t_emb = self.time_embed(t_emb)
+
+    hs = []
+    h = x
+
+    # helper wrapper to force grad inside checkpoint
+    def fw_with_grad(module, h, t_emb, y, dense_y, num_frames):
+        with torch.set_grad_enabled(True):
+            return module(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+
+    # ---------- input blocks ----------
+    for module in self.input_blocks:
+        if use_checkpoint:
+            h = checkpoint(fw_with_grad, module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        else:
+            h = module(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+        hs.append(h)
+
+    # ---------- middle block ----------
+    if use_checkpoint:
+        h = checkpoint(fw_with_grad, self.middle_block, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+    else:
+        h = self.middle_block(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+
+    # ---------- output blocks ----------
+    for module in self.output_blocks:
+        h = torch.cat([h, hs.pop()], dim=1)
+        if use_checkpoint:
+            h = checkpoint(fw_with_grad, module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        else:
+            h = module(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+
+    return self.out(h)
+🔎 Key Points
+fw_with_grad ensures checkpointed calls don’t disable grad.
+
+use_checkpoint=True lets you toggle memory-saving mode on/off.
+
+Works fine for LoRA-injected modules (trainable adapters will still get gradients).
+
+Student can keep using vanilla checkpoint (cheaper).
+
+⚡ This way:
+
+Teacher LoRA = memory efficient + trainable.
+
+Student = can use normal checkpointing without wrapper.
+
+Do you want me to also refactor so teacher uses checkpoint-safe mode but student still uses regular checkpointing inside the same training loop?
+
+You said:
+always use checkpoint
+ChatGPT said:
+Got it ✅ If you always want checkpointing (teacher + student, but teacher safe for LoRA), we can hard-wire it into the forward.
+
+Here’s the always-checkpoint version of your forward:
+
+import torch
+from torch.utils.checkpoint import checkpoint
+
+def forward(self,
+            x: torch.Tensor,
+            t: torch.Tensor,
+            y: torch.Tensor,
+            dense_y: torch.Tensor,
+            num_frames: int | None = None,
+) -> torch.Tensor:
+    num_frames = num_frames or self.params.num_frames
+
+    # timestep embedding
+    t_emb = timestep_embedding(t, self.model_channels)
+    t_emb = self.time_embed(t_emb)
+
+    hs = []
+    h = x
+
+    # helper wrapper: force grads inside checkpoint
+    def fw_with_grad(module, h, t_emb, y, dense_y, num_frames):
+        with torch.set_grad_enabled(True):
+            return module(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+
+    # ---------- input blocks ----------
+    for module in self.input_blocks:
+        h = checkpoint(fw_with_grad, module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        hs.append(h)
+
+    # ---------- middle block ----------
+    h = checkpoint(fw_with_grad, self.middle_block, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+
+    # ---------- output blocks ----------
+    for module in self.output_blocks:
+        h = torch.cat([h, hs.pop()], dim=1)
+        h = checkpoint(fw_with_grad, module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+
+    return self.out(h)
+🔎 What changed
+Removed the use_checkpoint flag → now checkpointing is always applied.
+
+Every block (input, middle, output) goes through fw_with_grad → ensures LoRA adapters always stay trainable.
+
+Works for teacher with LoRA and student (vanilla).
+
+⚡ This will save memory, but keep LoRA gradients alive.
+
+👉 Do you also want me to show you how to verify that LoRA params in the teacher are actually getting gradients (sanity check after a backward pass)?
+
+You said:
+class ModelMixin(torch.nn.Module, PushToHubMixin):
+    r"""
+    Base class for all models.
+
+    [ModelMixin] takes care of storing the model configuration and provides methods for loading, downloading and
+    saving models.
+
+        - **config_name** ([str]) -- Filename to save a model to when calling [~models.ModelMixin.save_pretrained].
+    """
+
+    config_name = CONFIG_NAME
+    _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
+    _supports_gradient_checkpointing = False
+    _keys_to_ignore_on_load_unexpected = None
+    _no_split_modules = None
+    _keep_in_fp32_modules = None
+    _skip_layerwise_casting_patterns = None
+    _supports_group_offloading = True
+    _repeated_blocks = []
+
+    def __init__(self):
+        super().__init__()
+
+        self._gradient_checkpointing_func = None
+
+    def __getattr__(self, name: str) -> Any:
+        """The only reason we overwrite getattr here is to gracefully deprecate accessing
+        config attributes directly. See https://github.com/huggingface/diffusers/pull/3129 We need to overwrite
+        __getattr__ here in addition so that we don't trigger torch.nn.Module's __getattr__':
+        https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module
+        """
+
+        is_in_config = "_internal_dict" in self.__dict__ and hasattr(self.__dict__["_internal_dict"], name)
+        is_attribute = name in self.__dict__
+
+        if is_in_config and not is_attribute:
+            deprecation_message = f"Accessing config attribute {name} directly via '{type(self).__name__}' object attribute is deprecated. Please access '{name}' over '{type(self).__name__}'s config object instead, e.g. 'unet.config.{name}'."
+            deprecate("direct config name access", "1.0.0", deprecation_message, standard_warn=False, stacklevel=3)
+            return self._internal_dict[name]
+
+        # call PyTorch's https://pytorch.org/docs/stable/_modules/torch/nn/modules/module.html#Module
+        return super().__getattr__(name)
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        """
+        Whether gradient checkpointing is activated for this model or not.
+        """
+        return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
+
+    def enable_gradient_checkpointing(self, gradient_checkpointing_func: Optional[Callable] = None) -> None:
+        """
+        Activates gradient checkpointing for the current model (may be referred to as *activation checkpointing* or
+        *checkpoint activations* in other frameworks).
+
+        Args:
+            gradient_checkpointing_func (Callable, *optional*):
+                The function to use for gradient checkpointing. If None, the default PyTorch checkpointing function
+                is used (torch.utils.checkpoint.checkpoint).
+        """
+        if not self._supports_gradient_checkpointing:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support gradient checkpointing. Please make sure to set the boolean attribute "
+                f"_supports_gradient_checkpointing to True in the class definition."
+            )
+
+        if gradient_checkpointing_func is None:
+
+            def _gradient_checkpointing_func(module, *args):
+                ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                return torch.utils.checkpoint.checkpoint(
+                    module.__call__,
+                    *args,
+                    **ckpt_kwargs,
+                )
+
+            gradient_checkpointing_func = _gradient_checkpointing_func
+
+        self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+can I inherit seva model with ModelMixin to use enable_gradient checkpointing ?
+ChatGPT said:
+Yes ✅ — you can inherit your Seva model from ModelMixin (or mix it in via multiple inheritance) to get access to enable_gradient_checkpointing.
+
+Right now, your Seva model probably inherits only from torch.nn.Module. To enable gradient checkpointing using the Hugging Face style, you need two things:
+
+Mark the model as supporting gradient checkpointing by setting
+
+_supports_gradient_checkpointing = True
+Implement _set_gradient_checkpointing in your model class.
+This tells the mixin how to toggle checkpointing on/off for your submodules.
+
+Here’s a minimal example for wrapping your Seva model with ModelMixin:
+
+from diffusers.models.modeling_utils import ModelMixin
+import torch.nn as nn
+
+class Seva(ModelMixin, nn.Module):
+    _supports_gradient_checkpointing = True  # important!
+
+    def __init__(self, ...):
+        super().__init__()
+        # define your layers here
+        self.layer1 = nn.Linear(128, 128)
+        self.layer2 = nn.Linear(128, 128)
+
+    def forward(self, x, ...):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return x
+
+    def _set_gradient_checkpointing(self, module, value: bool = False):
+        """Hook used by ModelMixin.enable_gradient_checkpointing"""
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = value
+Then you can do:
+
+model = Seva(...)
+model.enable_gradient_checkpointing()
+and your forward will automatically run with checkpointed activations.
+
+👉 The tricky part: ModelMixin doesn’t checkpoint everything by default; it relies on _set_gradient_checkpointing to propagate into your submodules (like attention blocks, UNet blocks, etc.). If your Seva is structured like UNet/Transformer blocks, you need to define how to toggle .gradient_checkpointing inside them.
+
+Do you want me to show you a concrete _set_gradient_checkpointing for a UNet-style diffusion model (so only attention/residual blocks are checkpointed, not everything)?
+
+You said:
+class Seva(nn.Module):
+    def __init__(self, params: SevaParams) -> None:
+        super().__init__()
+        self.params = params
+        self.model_channels = params.model_channels
+        self.out_channels = params.out_channels
+        self.num_head_channels = params.num_head_channels
+
+        time_embed_dim = params.model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(params.model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential(
+                    nn.Conv2d(params.in_channels, params.model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = params.model_channels
+        input_block_chans = [params.model_channels]
+        ch = params.model_channels
+        ds = 1
+        for level, mult in enumerate(params.channel_mult):
+            for _ in range(params.num_res_blocks):
+                input_layers: list[ResBlock | MultiviewTransformer | Downsample] = [
+                    ResBlock(
+                        channels=ch,
+                        emb_channels=time_embed_dim,
+                        out_channels=mult * params.model_channels,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = mult * params.model_channels
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+                    input_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"input_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*input_layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(params.channel_mult) - 1:
+                ds *= 2
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(Downsample(ch, out_channels=out_ch))
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                self._feature_size += ch
+
+        num_heads = ch // params.num_head_channels
+        dim_head = params.num_head_channels
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+            MultiviewTransformer(
+                ch,
+                num_heads,
+                dim_head,
+                name=f"middle_ds{ds}",
+                depth=params.transformer_depth[-1],
+                context_dim=params.context_dim,
+                unflatten_names=params.unflatten_names,
+            ),
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(params.channel_mult))[::-1]:
+            for i in range(params.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                output_layers: list[ResBlock | MultiviewTransformer | Upsample] = [
+                    ResBlock(
+                        channels=ch + ich,
+                        emb_channels=time_embed_dim,
+                        out_channels=params.model_channels * mult,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = params.model_channels * mult
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+
+                    output_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"output_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                if level and i == params.num_res_blocks:
+                    out_ch = ch
+                    ds //= 2
+                    output_layers.append(Upsample(ch, out_ch))
+                self.output_blocks.append(TimestepEmbedSequential(*output_layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            GroupNorm32(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(self.model_channels, params.out_channels, 3, padding=1),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        dense_y: torch.Tensor,
+        num_frames: int | None = None,
+    ) -> torch.Tensor:
+        num_frames = num_frames or self.params.num_frames
+        t_emb = timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        hs = []
+        h = x
+        for module in self.input_blocks:
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+            hs.append(h)
+        h = self.middle_block(
+            h,
+            emb=t_emb,
+            context=y,
+            dense_emb=dense_y,
+            num_frames=num_frames,
+        )
+        #h = checkpoint(self.middle_block, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        return self.out(h)
+
+
+class SGMWrapper(nn.Module):
+    def __init__(self, module: Seva):
+        super().__init__()
+        self.module = module
+
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor, c: dict, **kwargs
+    ) -> torch.Tensor:
+        x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=1)
+        return self.module(
+            x,
+            t=t,
+            y=c["crossattn"],
+            dense_y=c["dense_vector"],
+            **kwargs,
+        )
+show me code after update seva model
+ChatGPT said:
+Got it 👍 Thanks for sharing full Seva.
+Right now you already sprinkled some checkpoint(module, ...) calls but commented them out. To make this clean and Hugging Face–style (via ModelMixin.enable_gradient_checkpointing()), we’ll:
+
+Inherit from ModelMixin in Seva.
+
+Set _supports_gradient_checkpointing = True.
+
+Implement _set_gradient_checkpointing so that only heavy modules (ResBlock, MultiviewTransformer, maybe TimestepEmbedSequential) are checkpointed.
+
+Use the checkpoint function injected by ModelMixin (instead of manually uncommenting everywhere).
+
+Here’s the updated Seva (minimal working change):
+
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint
+from diffusers.models.modeling_utils import ModelMixin
+
+
+class Seva(ModelMixin, nn.Module):
+    _supports_gradient_checkpointing = True
+
+    def __init__(self, params: SevaParams) -> None:
+        super().__init__()
+        self.params = params
+        self.model_channels = params.model_channels
+        self.out_channels = params.out_channels
+        self.num_head_channels = params.num_head_channels
+
+        time_embed_dim = params.model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(params.model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential(
+                    nn.Conv2d(params.in_channels, params.model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = params.model_channels
+        input_block_chans = [params.model_channels]
+        ch = params.model_channels
+        ds = 1
+        for level, mult in enumerate(params.channel_mult):
+            for _ in range(params.num_res_blocks):
+                input_layers: list[ResBlock | MultiviewTransformer | Downsample] = [
+                    ResBlock(
+                        channels=ch,
+                        emb_channels=time_embed_dim,
+                        out_channels=mult * params.model_channels,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = mult * params.model_channels
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+                    input_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"input_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*input_layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(params.channel_mult) - 1:
+                ds *= 2
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(Downsample(ch, out_channels=out_ch))
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                self._feature_size += ch
+
+        num_heads = ch // params.num_head_channels
+        dim_head = params.num_head_channels
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+            MultiviewTransformer(
+                ch,
+                num_heads,
+                dim_head,
+                name=f"middle_ds{ds}",
+                depth=params.transformer_depth[-1],
+                context_dim=params.context_dim,
+                unflatten_names=params.unflatten_names,
+            ),
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(params.channel_mult))[::-1]:
+            for i in range(params.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                output_layers: list[ResBlock | MultiviewTransformer | Upsample] = [
+                    ResBlock(
+                        channels=ch + ich,
+                        emb_channels=time_embed_dim,
+                        out_channels=params.model_channels * mult,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = params.model_channels * mult
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+
+                    output_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"output_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                if level and i == params.num_res_blocks:
+                    out_ch = ch
+                    ds //= 2
+                    output_layers.append(Upsample(ch, out_ch))
+                self.output_blocks.append(TimestepEmbedSequential(*output_layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            GroupNorm32(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(self.model_channels, params.out_channels, 3, padding=1),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        dense_y: torch.Tensor,
+        num_frames: int | None = None,
+    ) -> torch.Tensor:
+        num_frames = num_frames or self.params.num_frames
+        t_emb = timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        hs = []
+        h = x
+        for module in self.input_blocks:
+            if self.is_gradient_checkpointing and self.training:
+                h = self._gradient_checkpointing_func(
+                    module, h, t_emb, y, dense_y, num_frames
+                )
+            else:
+                h = module(
+                    h,
+                    emb=t_emb,
+                    context=y,
+                    dense_emb=dense_y,
+                    num_frames=num_frames,
+                )
+            hs.append(h)
+
+        if self.is_gradient_checkpointing and self.training:
+            h = self._gradient_checkpointing_func(
+                self.middle_block, h, t_emb, y, dense_y, num_frames
+            )
+        else:
+            h = self.middle_block(
+                h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames
+            )
+
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            if self.is_gradient_checkpointing and self.training:
+                h = self._gradient_checkpointing_func(
+                    module, h, t_emb, y, dense_y, num_frames
+                )
+            else:
+                h = module(
+                    h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames
+                )
+
+        return self.out(h)
+
+    def _set_gradient_checkpointing(self, module, value: bool = False):
+        """Called by enable_gradient_checkpointing()"""
+        if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+            module.gradient_checkpointing = value
+Key points:
+✅ Now you can do:
+
+seva = Seva(params)
+seva.enable_gradient_checkpointing()
+✅ Forward automatically uses checkpointing when self.is_gradient_checkpointing and self.training is true.
+
+✅ You don’t need to manually comment/uncomment checkpoint lines.
+
+Do you also want me to show you an updated SGMWrapper that transparently supports checkpointing as well (so you can wrap/unwarp without breaking)?
+
+You said:
+Traceback (most recent call last):
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/oral20.py", line 11, in <module>
+    from seva.eval import transform_img_and_K, get_value_dict, save_output, seed_everything, decode_output
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/seva/eval.py", line 25, in <module>
+    from seva.utils import seed_everything
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/seva/utils.py", line 7, in <module>
+    from seva.model import Seva, SevaParams
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/seva/model.py", line 39, in <module>
+    class Seva(nn.Module, ModelMixin):
+TypeError: Cannot create a consistent method resolution
+order (MRO) for bases Module, ModelMixin
+ChatGPT said:
+Ah, I see the issue 👀
+
+ModelMixin from 🤗 diffusers is already a subclass of torch.nn.Module.
+So when you write:
+
+class Seva(nn.Module, ModelMixin):
+you’re inheriting nn.Module twice, which causes the MRO conflict you’re seeing:
+
+TypeError: Cannot create a consistent method resolution order (MRO)
+✅ Fix
+Just inherit from ModelMixin only (it already brings in nn.Module):
+
+from diffusers.models.modeling_utils import ModelMixin
+
+class Seva(ModelMixin):
+    _supports_gradient_checkpointing = True
+    ...
+That’s all you need — you still get nn.Module behavior plus Hugging Face checkpointing, saving, and hub support.
+
+⚡️ Quick note:
+If you want to keep things clean, put ModelMixin first in inheritance when mixing multiple bases, but in this case you only need ModelMixin.
+
+👉 Do you want me to update the full Seva definition I sent earlier with this corrected inheritance (class Seva(ModelMixin):)?
+
+You said:
+ is recommended to upgrade the kernel to the minimum version or higher.
+trainable params: 798,720 || all params: 1,264,766,724 || trainable%: 0.0632
+Traceback (most recent call last):
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/oral20.py", line 290, in <module>
+    tyro.cli(main)
+  File "/home/tannv34/Working/miniconda3/envs/seva/lib/python3.11/site-packages/tyro/_cli.py", line 238, in cli
+    return run_with_args_from_cli()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lustre/scratch/client/movian/research/users/tannv34/stable-virtual-camera/oral20.py", line 182, in main
+    teacher.module.enable_gradient_checkpointing()
+  File "/home/tannv34/Working/miniconda3/envs/seva/lib/python3.11/site-packages/diffusers/models/modeling_utils.py", line 310, in enable_gradient_checkpointing
+    self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+TypeError: Seva._set_gradient_checkpointing() got an unexpected keyword argument 'enable'
+ChatGPT said:
+Got it 👍 That traceback is very helpful.
+
+The problem is:
+🤗 ModelMixin.enable_gradient_checkpointing() calls
+
+self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+But in your Seva, you defined:
+
+def _set_gradient_checkpointing(self, module, value: bool = False):
+    ...
+So the signatures don’t match → Python raises
+
+TypeError: Seva._set_gradient_checkpointing() got an unexpected keyword argument 'enable'
+✅ Fix
+You need to use the exact signature Hugging Face expects:
+
+def _set_gradient_checkpointing(self, module, enable: bool = False, gradient_checkpointing_func=None):
+    if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+        module.gradient_checkpointing = enable
+This way, enable_gradient_checkpointing() can pass both enable and gradient_checkpointing_func safely.
+
+Updated snippet for your Seva
+class Seva(ModelMixin):
+    _supports_gradient_checkpointing = True
+    ...
+
+    def _set_gradient_checkpointing(self, module, enable: bool = False, gradient_checkpointing_func=None):
+        if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+            module.gradient_checkpointing = enable
+⚡️ After this change, calling:
+
+teacher.module.enable_gradient_checkpointing()
+will work without error ✅
+
+Do you also want me to show how to make checkpoint() use the injected gradient_checkpointing_func instead of the hardcoded one, so your teacher LoRA + checkpoint works seamlessly?
+
+You said:
+File "/home/tannv34/Working/miniconda3/envs/seva/lib/python3.11/site-packages/diffusers/models/modeling_utils.py", line 310, in enable_gradient_checkpointing
+    self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+TypeError: Seva._set_gradient_checkpointing() missing 1 required positional argument: 'module'
+ChatGPT said:
+Ah, I see the confusion 👀
+
+There are two different patterns for _set_gradient_checkpointing depending on whether you want per-layer control (like 🤗 transformers) or whole-model control (like 🤗 diffusers).
+
+What’s happening:
+ModelMixin.enable_gradient_checkpointing() (in diffusers) does not loop over modules.
+
+Instead, it just calls:
+
+self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+So in diffusers, _set_gradient_checkpointing is meant to toggle on the whole model, not per module.
+
+That’s why you got:
+
+TypeError: Seva._set_gradient_checkpointing() missing 1 required positional argument: 'module'
+because your version expected (self, module, ...).
+
+✅ Correct implementation for diffusers
+class Seva(ModelMixin):
+    _supports_gradient_checkpointing = True
+    ...
+
+    def _set_gradient_checkpointing(self, enable: bool = False, gradient_checkpointing_func=None):
+        # Save the function we’ll use for checkpointing
+        self._gradient_checkpointing_func = gradient_checkpointing_func
+
+        # Flag that children can read
+        for module in self.modules():
+            if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+                module.gradient_checkpointing = enable
+✅ How forward will use it
+In your forward pass, you already had:
+
+if self.is_gradient_checkpointing and self.training:
+    h = self._gradient_checkpointing_func(module, h, t_emb, y, dense_y, num_frames)
+else:
+    h = module(h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames)
+That will now work correctly because self._gradient_checkpointing_func is set by enable_gradient_checkpointing().
+
+⚡️ So to summarize:
+
+In diffusers, _set_gradient_checkpointing is model-wide (no module arg).
+
+In transformers, it’s per-layer (takes module arg).
+You want the diffusers-style one.
+
+👉 Do you want me to give you the full fixed Seva class with this correction already applied so you can just drop it in?
+
+You said:
+class Seva(ModelMixin):
+    _supports_gradient_checkpointing = True
+    def __init__(self, params: SevaParams) -> None:
+        super().__init__()
+        self.params = params
+        self.model_channels = params.model_channels
+        self.out_channels = params.out_channels
+        self.num_head_channels = params.num_head_channels
+
+        time_embed_dim = params.model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(params.model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential(
+                    nn.Conv2d(params.in_channels, params.model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = params.model_channels
+        input_block_chans = [params.model_channels]
+        ch = params.model_channels
+        ds = 1
+        for level, mult in enumerate(params.channel_mult):
+            for _ in range(params.num_res_blocks):
+                input_layers: list[ResBlock | MultiviewTransformer | Downsample] = [
+                    ResBlock(
+                        channels=ch,
+                        emb_channels=time_embed_dim,
+                        out_channels=mult * params.model_channels,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = mult * params.model_channels
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+                    input_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"input_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*input_layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(params.channel_mult) - 1:
+                ds *= 2
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(Downsample(ch, out_channels=out_ch))
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                self._feature_size += ch
+
+        num_heads = ch // params.num_head_channels
+        dim_head = params.num_head_channels
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+            MultiviewTransformer(
+                ch,
+                num_heads,
+                dim_head,
+                name=f"middle_ds{ds}",
+                depth=params.transformer_depth[-1],
+                context_dim=params.context_dim,
+                unflatten_names=params.unflatten_names,
+            ),
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(params.channel_mult))[::-1]:
+            for i in range(params.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                output_layers: list[ResBlock | MultiviewTransformer | Upsample] = [
+                    ResBlock(
+                        channels=ch + ich,
+                        emb_channels=time_embed_dim,
+                        out_channels=params.model_channels * mult,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = params.model_channels * mult
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+
+                    output_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"output_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                if level and i == params.num_res_blocks:
+                    out_ch = ch
+                    ds //= 2
+                    output_layers.append(Upsample(ch, out_ch))
+                self.output_blocks.append(TimestepEmbedSequential(*output_layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            GroupNorm32(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(self.model_channels, params.out_channels, 3, padding=1),
+        )
+    def _set_gradient_checkpointing(self, module, enable: bool = False, gradient_checkpointing_func=None):
+        if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+            module.gradient_checkpointing = enable
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        dense_y: torch.Tensor,
+        num_frames: int | None = None,
+    ) -> torch.Tensor:
+        num_frames = num_frames or self.params.num_frames
+        t_emb = timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        hs = []
+        h = x
+        for module in self.input_blocks:
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+            hs.append(h)
+        h = self.middle_block(
+            h,
+            emb=t_emb,
+            context=y,
+            dense_emb=dense_y,
+            num_frames=num_frames,
+        )
+        #h = checkpoint(self.middle_block, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            h = module(
+                h,
+                emb=t_emb,
+                context=y,
+                dense_emb=dense_y,
+                num_frames=num_frames,
+            )
+            #h = checkpoint(module, h, t_emb, y, dense_y, num_frames, use_reentrant=True)
+        return self.out(h)
+this is my current 
+ChatGPT said:
+
+Thought for a couple of seconds
+Nice — thanks for sharing your current class. The error you hit earlier came from using the wrong _set_gradient_checkpointing signature. Below I give a corrected, drop-in Seva class that:
+
+Uses ModelMixin properly (class Seva(ModelMixin): — as you have),
+
+Implements the diffusers-style _set_gradient_checkpointing(enable, gradient_checkpointing_func) (model-wide),
+
+Saves the provided gradient_checkpointing_func onto self._gradient_checkpointing_func,
+
+Uses that injected function inside forward whenever self.is_gradient_checkpointing and self.training (so checkpointing is active only in train mode),
+
+Only flips .gradient_checkpointing on targeted submodules (ResBlock, MultiviewTransformer, TimestepEmbedSequential).
+
+Drop this in to replace your current Seva definition:
+
+from diffusers.models.modeling_utils import ModelMixin
+
+class Seva(ModelMixin):
+    _supports_gradient_checkpointing = True
+
+    def __init__(self, params: SevaParams) -> None:
+        super().__init__()
+        self.params = params
+        self.model_channels = params.model_channels
+        self.out_channels = params.out_channels
+        self.num_head_channels = params.num_head_channels
+
+        time_embed_dim = params.model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(params.model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential(
+                    nn.Conv2d(params.in_channels, params.model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = params.model_channels
+        input_block_chans = [params.model_channels]
+        ch = params.model_channels
+        ds = 1
+        for level, mult in enumerate(params.channel_mult):
+            for _ in range(params.num_res_blocks):
+                input_layers: list[ResBlock | MultiviewTransformer | Downsample] = [
+                    ResBlock(
+                        channels=ch,
+                        emb_channels=time_embed_dim,
+                        out_channels=mult * params.model_channels,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = mult * params.model_channels
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+                    input_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"input_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*input_layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(params.channel_mult) - 1:
+                ds *= 2
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(Downsample(ch, out_channels=out_ch))
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                self._feature_size += ch
+
+        num_heads = ch // params.num_head_channels
+        dim_head = params.num_head_channels
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+            MultiviewTransformer(
+                ch,
+                num_heads,
+                dim_head,
+                name=f"middle_ds{ds}",
+                depth=params.transformer_depth[-1],
+                context_dim=params.context_dim,
+                unflatten_names=params.unflatten_names,
+            ),
+            ResBlock(
+                channels=ch,
+                emb_channels=time_embed_dim,
+                out_channels=None,
+                dense_in_channels=params.dense_in_channels,
+                dropout=params.dropout,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(params.channel_mult))[::-1]:
+            for i in range(params.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                output_layers: list[ResBlock | MultiviewTransformer | Upsample] = [
+                    ResBlock(
+                        channels=ch + ich,
+                        emb_channels=time_embed_dim,
+                        out_channels=params.model_channels * mult,
+                        dense_in_channels=params.dense_in_channels,
+                        dropout=params.dropout,
+                    )
+                ]
+                ch = params.model_channels * mult
+                if ds in params.attention_resolutions:
+                    num_heads = ch // params.num_head_channels
+                    dim_head = params.num_head_channels
+
+                    output_layers.append(
+                        MultiviewTransformer(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            name=f"output_ds{ds}",
+                            depth=params.transformer_depth[level],
+                            context_dim=params.context_dim,
+                            unflatten_names=params.unflatten_names,
+                        )
+                    )
+                if level and i == params.num_res_blocks:
+                    out_ch = ch
+                    ds //= 2
+                    output_layers.append(Upsample(ch, out_ch))
+                self.output_blocks.append(TimestepEmbedSequential(*output_layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            GroupNorm32(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(self.model_channels, params.out_channels, 3, padding=1),
+        )
+
+    # Diffusers-style model-wide setter (called by ModelMixin.enable_gradient_checkpointing)
+    def _set_gradient_checkpointing(self, enable: bool = False, gradient_checkpointing_func=None):
+        # store the checkpoint function provided by ModelMixin.enable_gradient_checkpointing
+        # (ModelMixin passes this in as `gradient_checkpointing_func`)
+        self._gradient_checkpointing_func = gradient_checkpointing_func
+
+        # propagate the boolean flag to submodules we want to checkpoint
+        for module in self.modules():
+            if isinstance(module, (ResBlock, MultiviewTransformer, TimestepEmbedSequential)):
+                module.gradient_checkpointing = enable
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        dense_y: torch.Tensor,
+        num_frames: int | None = None,
+    ) -> torch.Tensor:
+        num_frames = num_frames or self.params.num_frames
+        t_emb = timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        hs = []
+        h = x
+        # input blocks
+        for module in self.input_blocks:
+            if self.is_gradient_checkpointing and self.training:
+                # use the injected checkpoint function from ModelMixin
+                h = self._gradient_checkpointing_func(module, h, t_emb, y, dense_y, num_frames)
+            else:
+                h = module(
+                    h,
+                    emb=t_emb,
+                    context=y,
+                    dense_emb=dense_y,
+                    num_frames=num_frames,
+                )
+            hs.append(h)
+
+        # middle block
+        if self.is_gradient_checkpointing and self.training:
+            h = self._gradient_checkpointing_func(self.middle_block, h, t_emb, y, dense_y, num_frames)
+        else:
+            h = self.middle_block(
+                h, emb=t_emb, context=y, dense_emb=dense_y, num_frames=num_frames
+            )
+
+        # output blocks
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            if self.is_gradient_checkpointing and self.training:
+                h = self._gradient_checkpointing_func(module, h, t_emb, y, dense_y, num_frames)
+            else:
+                h = module(
+                    h,
+                    emb=t_emb,
+                    context=y,
+                    dense_emb=dense_y,
+                    num_frames=num_frames,
+                )
+        return self.out(h)
+Notes & usage
+Call model.enable_gradient_checkpointing() (or teacher.module.enable_gradient_checkpointing() if teacher is a wrapper) to set checkpointing. That call will set self._gradient_checkpointing_func for you.
+
+self.is_gradient_checkpointing is read-only and reflects whether any child module has gradient_checkpointing=True.
+
+Checkpointing will only be active during training (self.training) in this forward; that prevents accidental checkpointing at inference time.
+
+If you want checkpointing always (train + eval), remove the and self.training condition (but normally you only need it for training).
+
+Quick sanity checks
+After creating and enabling checkpointing, run:
+
+print(model._gradient_checkpointing_func)         # should be not-None
+print(model.is_gradient_checkpointing)           # should be True
+Then run a forward + backward and confirm LoRA params (or targeted params) receive .grad (inspect .parameters() grads).
+
+If you want, I can also:
+
+Patch SGMWrapper so enable_gradient_checkpointing() is available from the wrapper directly (simple forward-through),
+
+Show a tiny unit-test snippet that runs a forward+backward and asserts LoRA adapter grads are non-None.
+
+
+

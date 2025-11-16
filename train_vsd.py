@@ -183,7 +183,7 @@ def main(
     device = accelerator.device
     seed_everything(seed)
     # Dataset
-    dataset = Image_Camera(root_dir=input_imgs,cached_dir='cached_features120', preset_traj=preset_traj, num_frames=num_frames, zoom_factor=zoom_factor, camera_scale=camera_scale)
+    dataset = Image_Camera(root_dir=input_imgs,cached_dir='cached_features', preset_traj=preset_traj, num_frames=num_frames, zoom_factor=zoom_factor, camera_scale=camera_scale)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     test_dataset = Image_Camera(root_dir=eval_imgs,cached_dir='cached_features_eval', preset_traj=preset_traj, num_frames=num_frames, zoom_factor=zoom_factor, camera_scale=camera_scale)
     testloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
@@ -472,7 +472,7 @@ def main(
                                     c_noise = denoiser.sigma_to_idx(sigma)
                     
                                     x[0] = encoded
-                                    noise_pred = teacher(x * c_in, c_noise, cond, num_frames=T)
+                                    noise_pred = student(x * c_in, c_noise, cond, num_frames=T)
                                     
                                     x = x +  noise_pred * (sigmas[i + 1] -sigmas[i])
                                 samples = ae.decode(x, 1)
