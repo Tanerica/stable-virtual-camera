@@ -189,7 +189,7 @@ def main(
     testloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     # Model, ae, condition
     teacher = SGMWrapper(load_model(device="cpu", verbose=True).eval()).to(device)
-    teacher.module.to(dtype=torch.bfloat16)
+    #teacher.module.to(dtype=torch.bfloat16)
     config = LoraConfig(
         r=8,
         lora_alpha=16,
@@ -199,7 +199,7 @@ def main(
 
     teacher.module.add_adapter(config)
   
-    student = SGMWrapper(load_model(device="cpu", verbose=True)).to(dtype=torch.bfloat16)
+    student = SGMWrapper(load_model(device="cpu", verbose=True))
     student.to(device)
     
     teacher.train()
@@ -393,7 +393,7 @@ def main(
                 
                 del target, student_original
                 # LORA UPDATE
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
                 
                 noise = torch.randn_like(latent)
                 # Add noise for teacher prediction
@@ -422,7 +422,11 @@ def main(
                 accelerator.log({"train_loss_vsd": loss_vsd, "lora_loss": loss_lora}, step=global_step
                                 )
                 progress_bar.update(1)
-                if accelerator.is_main_process:   
+                if accelerator.is_main_process: 
+                    print(f"[After cleanup] Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                    print(f"[After cleanup] Cached:    {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+                    free, total = torch.cuda.mem_get_info()
+                    print(f"Free: {free/1024**3:.2f} GB, Total: {total/1024**3:.2f} GB")  
                     if (global_step + 1) % eval_step == 0:
                         for batch_idx, value_dict in enumerate(testloader):
                             # Extract batch data

@@ -138,7 +138,7 @@ import torch
 SAVE_FEATURE_DIR = "cached_features"
 
 def main(
-    eval_imgs: str = "./eval_data",
+    eval_imgs: str = "./sana_gen/data",
     seed: int = 36,
     cfg: float = 4.0,
     preset_traj: str = "orbit",
